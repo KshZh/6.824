@@ -65,11 +65,14 @@ func Sequential(jobName string, files []string, nreduce int,
 	go mr.run(jobName, files, nreduce, func(phase jobPhase) {
 		switch phase {
 		case mapPhase:
+			// The master considers each input file to be one map task.
 			for i, f := range mr.files {
+				// 串行调用。
 				doMap(mr.jobName, i, f, mr.nReduce, mapF)
 			}
 		case reducePhase:
 			for i := 0; i < mr.nReduce; i++ {
+				// 串行调用。
 				doReduce(mr.jobName, i, mergeName(mr.jobName, i), len(mr.files), reduceF)
 			}
 		}
@@ -89,7 +92,7 @@ func (mr *Master) forwardRegistrations(ch chan string) {
 		if len(mr.workers) > i {
 			// there's a worker that we haven't told schedule() about.
 			w := mr.workers[i]
-			go func() { ch <- w }() // send without holding the lock.
+			go func() { ch <- w }() // XXX send without holding the lock.
 			i = i + 1
 		} else {
 			// wait for Register() to add an entry to workers[]
@@ -107,6 +110,7 @@ func Distributed(jobName string, files []string, nreduce int, master string) (mr
 	mr.startRPCServer()
 	go mr.run(jobName, files, nreduce,
 		func(phase jobPhase) {
+			// 创建一个channel实体，传递引用给其它线程，这样其它线程就可以通过底层这同一个channel实体与本线程交互。
 			ch := make(chan string)
 			go mr.forwardRegistrations(ch)
 			schedule(mr.jobName, mr.files, mr.nReduce, phase, ch)

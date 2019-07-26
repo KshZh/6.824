@@ -143,6 +143,7 @@ func MakeNetwork() *Network {
 			select {
 			case xreq := <-rn.endCh:
 				atomic.AddInt32(&rn.count, 1)
+				println(rn.count)
 				go rn.ProcessReq(xreq)
 			case <-rn.done:
 				return

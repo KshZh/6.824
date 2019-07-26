@@ -1,7 +1,11 @@
 package mapreduce
 
 import (
+	"encoding/json"
 	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"os"
 )
 
 func doMap(
@@ -53,6 +57,35 @@ func doMap(
 	//
 	// Your code here (Part I).
 	//
+	bytes, err := ioutil.ReadFile(inFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	content := string(bytes[:])
+	kvs := mapF(inFile, content)
+
+	// 新建nReduce个输出文件和nReduce个encoder。
+	outFiles := make([]*os.File, nReduce)
+	encs := make([]*json.Encoder, nReduce)
+	for i := 0; i < nReduce; i++ {
+		// func reduceName(jobName string, mapTask int, reduceTask int) string
+		outFiles[i], err = os.Create(reduceName(jobName, mapTask, i))
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer outFiles[i].Close()
+		encs[i] = json.NewEncoder(outFiles[i])
+	}
+	for _, kv := range kvs {
+		// 将结果写入nReduce个中间文件中，使用"ihash(key) % nReduce"选择一个reduce线程r，
+		// 由r来处理nMap个中间文件"mrtmp.jobName-m-r"，由于采用hash计算出r，
+		// 所有输入文件中所有相同的key会被放入nMap个中间文件"mrtmp.jobName-x-r"并统一由线程r处理。
+		r := ihash(kv.Key) % nReduce
+		err := encs[r].Encode(&kv) // 传地址
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
 }
 
 func ihash(s string) int {

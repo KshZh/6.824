@@ -1,5 +1,12 @@
 package mapreduce
 
+import (
+	"encoding/json"
+	"log"
+	"os"
+	"sort"
+)
+
 func doReduce(
 	jobName string, // the name of the whole MapReduce job
 	reduceTask int, // which reduce task this is
@@ -44,4 +51,44 @@ func doReduce(
 	//
 	// Your code here (Part I).
 	//
+	var f *os.File
+	var dec *json.Decoder
+	var err error
+	var kv KeyValue
+	// 关键：使用map来合并具有相同key的KeyValue。
+	// 我们可以不用直接使用结构体KeyValue，多个具有相同key的KeyValue，其中真正的信息只有一个key和多个value。
+	m := make(map[string][]string)
+	// 打开nMap个map tasks为该reduce task计算出的nMap个文件，以及新建nMap个decoder。
+	for i := 0; i < nMap; i++ {
+		// func reduceName(jobName string, mapTask int, reduceTask int) string
+		f, err = os.Open(reduceName(jobName, i, reduceTask))
+		if err != nil {
+			log.Fatal(err)
+		}
+		dec = json.NewDecoder(f)
+		for dec.More() {
+			dec.Decode(&kv)
+			m[kv.Key] = append(m[kv.Key], kv.Value)
+		}
+		f.Close()
+	}
+
+	f, err = os.Create(outFile)
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var keys []string
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		err := enc.Encode(&KeyValue{Key: k, Value: reduceF(k, m[k])})
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
 }

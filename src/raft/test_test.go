@@ -19,7 +19,7 @@ import "sync"
 // (much more than the paper's range of timeouts).
 const RaftElectionTimeout = 1000 * time.Millisecond
 
-func TestInitialElection2A(t *testing.T) {
+func TestInitialElection2A(t *testing.T) { // 1
 	servers := 3
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
@@ -47,7 +47,7 @@ func TestInitialElection2A(t *testing.T) {
 	cfg.end()
 }
 
-func TestReElection2A(t *testing.T) {
+func TestReElection2A(t *testing.T) { // 2
 	servers := 3
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
@@ -83,7 +83,7 @@ func TestReElection2A(t *testing.T) {
 	cfg.end()
 }
 
-func TestBasicAgree2B(t *testing.T) {
+func TestBasicAgree2B(t *testing.T) { // 3
 	servers := 5
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
@@ -106,7 +106,7 @@ func TestBasicAgree2B(t *testing.T) {
 	cfg.end()
 }
 
-func TestFailAgree2B(t *testing.T) {
+func TestFailAgree2B(t *testing.T) { // 4
 	servers := 3
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
@@ -137,7 +137,7 @@ func TestFailAgree2B(t *testing.T) {
 	cfg.end()
 }
 
-func TestFailNoAgree2B(t *testing.T) {
+func TestFailNoAgree2B(t *testing.T) { // 5
 	servers := 5
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
@@ -188,7 +188,7 @@ func TestFailNoAgree2B(t *testing.T) {
 	cfg.end()
 }
 
-func TestConcurrentStarts2B(t *testing.T) {
+func TestConcurrentStarts2B(t *testing.T) { // 6
 	servers := 3
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
@@ -289,7 +289,7 @@ loop:
 	cfg.end()
 }
 
-func TestRejoin2B(t *testing.T) {
+func TestRejoin2B(t *testing.T) { // 7
 	servers := 3
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
@@ -327,7 +327,7 @@ func TestRejoin2B(t *testing.T) {
 	cfg.end()
 }
 
-func TestBackup2B(t *testing.T) {
+func TestBackup2B(t *testing.T) { // 8
 	servers := 5
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
@@ -399,7 +399,7 @@ func TestBackup2B(t *testing.T) {
 	cfg.end()
 }
 
-func TestCount2B(t *testing.T) {
+func TestCount2B(t *testing.T) { // 9
 	servers := 3
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
@@ -509,7 +509,7 @@ loop:
 	cfg.end()
 }
 
-func TestPersist12C(t *testing.T) {
+func TestPersist12C(t *testing.T) { // 10
 	servers := 3
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
@@ -555,7 +555,7 @@ func TestPersist12C(t *testing.T) {
 	cfg.end()
 }
 
-func TestPersist22C(t *testing.T) {
+func TestPersist22C(t *testing.T) { // 11
 	servers := 5
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
@@ -601,7 +601,7 @@ func TestPersist22C(t *testing.T) {
 	cfg.end()
 }
 
-func TestPersist32C(t *testing.T) {
+func TestPersist32C(t *testing.T) { // 12
 	servers := 3
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
@@ -641,7 +641,7 @@ func TestPersist32C(t *testing.T) {
 // The leader in a new term may try to finish replicating log entries that
 // haven't been committed yet.
 //
-func TestFigure82C(t *testing.T) {
+func TestFigure82C(t *testing.T) { // 13
 	servers := 5
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
@@ -652,10 +652,13 @@ func TestFigure82C(t *testing.T) {
 
 	nup := servers
 	for iters := 0; iters < 1000; iters++ {
+		// fmt.Println(iters)
 		leader := -1
 		for i := 0; i < servers; i++ {
 			if cfg.rafts[i] != nil {
+				// fmt.Printf("Start()\n")
 				_, _, ok := cfg.rafts[i].Start(rand.Int())
+				// fmt.Printf("Start() end\n")
 				if ok {
 					leader = i
 				}
@@ -664,23 +667,31 @@ func TestFigure82C(t *testing.T) {
 
 		if (rand.Int() % 1000) < 100 {
 			ms := rand.Int63() % (int64(RaftElectionTimeout/time.Millisecond) / 2)
+			// fmt.Printf("ms = %d\n", ms)
 			time.Sleep(time.Duration(ms) * time.Millisecond)
+			// fmt.Println("Sleep end")
 		} else {
 			ms := (rand.Int63() % 13)
+			// fmt.Printf("ms = %d\n", ms)
 			time.Sleep(time.Duration(ms) * time.Millisecond)
+			// fmt.Println("Sleep end")
 		}
 
 		if leader != -1 {
+			// fmt.Printf("crash leader %d\n", leader)
 			cfg.crash1(leader)
 			nup -= 1
+			// fmt.Printf("crash leader %d end, nup = %d\n", leader, nup)
 		}
 
 		if nup < 3 {
 			s := rand.Int() % servers
 			if cfg.rafts[s] == nil {
+				// fmt.Printf("restart raft %d\n", s)
 				cfg.start1(s)
 				cfg.connect(s)
 				nup += 1
+				// fmt.Printf("restart raft %d end, nup = %d\n", s, nup)
 			}
 		}
 	}
@@ -692,12 +703,13 @@ func TestFigure82C(t *testing.T) {
 		}
 	}
 
+	fmt.Println("one")
 	cfg.one(rand.Int(), servers, true)
 
 	cfg.end()
 }
 
-func TestUnreliableAgree2C(t *testing.T) {
+func TestUnreliableAgree2C(t *testing.T) { // 14
 	servers := 5
 	cfg := make_config(t, servers, true)
 	defer cfg.cleanup()
@@ -726,7 +738,7 @@ func TestUnreliableAgree2C(t *testing.T) {
 	cfg.end()
 }
 
-func TestFigure8Unreliable2C(t *testing.T) {
+func TestFigure8Unreliable2C(t *testing.T) { // 15
 	servers := 5
 	cfg := make_config(t, servers, true)
 	defer cfg.cleanup()
@@ -799,25 +811,33 @@ func internalChurn(t *testing.T, unreliable bool) {
 	cfn := func(me int, ch chan []int) {
 		var ret []int
 		ret = nil
-		defer func() { ch <- ret }()
+		defer func() {
+			// fmt.Printf("me %d start write ret into ch", me)
+			ch <- ret
+			// fmt.Printf("me %d end write ret into ch", me)
+		}() // 通过channel返回值到另一个线程，返回的是这个client rf.Start(x)成功的x的集合。
 		values := []int{}
 		for atomic.LoadInt32(&stop) == 0 {
 			x := rand.Int()
 			index := -1
 			ok := false
+			// fmt.Println("SSSSSSSSSS begin Start(x)")
 			for i := 0; i < servers; i++ {
 				// try them all, maybe one of them is a leader
 				cfg.mu.Lock()
-				rf := cfg.rafts[i]
+				rf := cfg.rafts[i] // 保存到局部引用，减小临界区。
 				cfg.mu.Unlock()
 				if rf != nil {
+					// fmt.Printf("SSSSSSSSSS begin Start(x) to %d", i)
 					index1, _, ok1 := rf.Start(x)
+					// fmt.Printf("SSSSSSSSSS end Start(x) to %d", i)
 					if ok1 {
 						ok = ok1
 						index = index1
 					}
 				}
 			}
+			// fmt.Println("SSSSSSSSSS end Start(x)")
 			if ok {
 				// maybe leader will commit our value, maybe not.
 				// but don't wait forever.
@@ -826,6 +846,8 @@ func internalChurn(t *testing.T, unreliable bool) {
 					if nd > 0 {
 						if xx, ok := cmd.(int); ok {
 							if xx == x {
+								// 如果leader最终commit了这个LogEntry，就把已commit的LogEntry添加到values中。
+								fmt.Printf("leader have commit command %d\n", x)
 								values = append(values, x)
 							}
 						} else {
@@ -833,23 +855,30 @@ func internalChurn(t *testing.T, unreliable bool) {
 						}
 						break
 					}
+					// fmt.Println("SSSSSSSSSS sleep")
 					time.Sleep(time.Duration(to) * time.Millisecond)
 				}
 			} else {
 				time.Sleep(time.Duration(79+me*17) * time.Millisecond)
 			}
+			// fmt.Println("SSSSSSSSSSget into next loop")
+			// 如果leader最终并没有commit这个LogEntry，那么就不会把未commit的LogEntry添加到values中，
+			// 而Sleep一段时间后Start另一个LogEntry。
 		}
+		// fmt.Println("SSSSSSSSSS stop")
 		ret = values
+		// fmt.Println("SSSSSSSSSS have write ret")
 	}
 
 	ncli := 3
 	cha := []chan []int{}
 	for i := 0; i < ncli; i++ {
 		cha = append(cha, make(chan []int))
-		go cfn(i, cha[i])
+		go cfn(i, cha[i]) // 启动ncli个client调用rf.Start(x)。
 	}
 
 	for iters := 0; iters < 20; iters++ {
+		// fmt.Println(iters)
 		if (rand.Int() % 1000) < 200 {
 			i := rand.Int() % servers
 			cfg.disconnect(i)
@@ -877,6 +906,7 @@ func internalChurn(t *testing.T, unreliable bool) {
 		time.Sleep((RaftElectionTimeout * 7) / 10)
 	}
 
+	fmt.Printf("%s\n", "crash/restart结束，重启/重连所有raft server")
 	time.Sleep(RaftElectionTimeout)
 	cfg.setunreliable(false)
 	for i := 0; i < servers; i++ {
@@ -887,15 +917,20 @@ func internalChurn(t *testing.T, unreliable bool) {
 	}
 
 	atomic.StoreInt32(&stop, 1)
+	fmt.Printf("%s\n", "客户端Start结束")
 
+	// 收集返回值。
 	values := []int{}
 	for i := 0; i < ncli; i++ {
+		fmt.Printf("i = %d\n", i)
 		vv := <-cha[i]
+		fmt.Printf("i = %d\n", i)
 		if vv == nil {
 			t.Fatal("client failed")
 		}
 		values = append(values, vv...)
 	}
+	fmt.Printf("%s\n", "收集完返回值")
 
 	time.Sleep(RaftElectionTimeout)
 
@@ -926,10 +961,10 @@ func internalChurn(t *testing.T, unreliable bool) {
 	cfg.end()
 }
 
-func TestReliableChurn2C(t *testing.T) {
+func TestReliableChurn2C(t *testing.T) { // 16
 	internalChurn(t, false)
 }
 
-func TestUnreliableChurn2C(t *testing.T) {
+func TestUnreliableChurn2C(t *testing.T) { // 17
 	internalChurn(t, true)
 }

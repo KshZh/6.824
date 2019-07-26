@@ -25,7 +25,8 @@ type Parallelism struct {
 type Worker struct {
 	sync.Mutex
 
-	name        string
+	name string
+	// 客户端提供的处理函数：
 	Map         func(string, string) []KeyValue
 	Reduce      func(string, []string) string
 	nRPC        int // quit after this many RPCs; protected by mutex
@@ -74,6 +75,7 @@ func (wk *Worker) DoTask(arg *DoTaskArgs, _ *struct{}) error {
 
 	switch arg.Phase {
 	case mapPhase:
+		// 在worker线程中串行调用。
 		doMap(arg.JobName, arg.TaskNumber, arg.File, arg.NumOtherPhase, wk.Map)
 	case reducePhase:
 		doReduce(arg.JobName, arg.TaskNumber, mergeName(arg.JobName, arg.TaskNumber), arg.NumOtherPhase, wk.Reduce)
@@ -107,7 +109,7 @@ func (wk *Worker) Shutdown(_ *struct{}, res *ShutdownReply) error {
 // Tell the master we exist and ready to work
 func (wk *Worker) register(master string) {
 	args := new(RegisterArgs)
-	args.Worker = wk.name
+	args.Worker = wk.name // 将worker线程自己的rpc服务的套接字告诉master，这样master才能通过rpc调用worker的DoTask()执行计算。
 	ok := call(master, "Master.Register", args, new(struct{}))
 	if ok == false {
 		fmt.Printf("Register: RPC %s register error\n", master)
