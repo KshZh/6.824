@@ -42,19 +42,22 @@ func Test1(t *testing.T) {
 			fmt.Println("ds")
 		default:
 			fmt.Println("default")
-			// 如果有default，ch<-false才触发case <-ch，没有default，ch<-false和close(ch)都触发case <-ch。
-			// 上面的说法是错误的，由于这个程序的主线程会很快退出，当这个线程没有被调度时，运行程序就不会打印"ds"。
-			// 其实是，ch<-false和close(ch)都可以触发case<-ch，无论有无default，只不过如果有default，select会在没有任何case触发的情况下执行default。
 		}
 	}()
+	// ch<-false和close(ch)都可以触发case<-ch，无论有无default，只不过如果有default，select会在没有任何case触发的情况下执行default。
 	// ch <- false
 	close(ch)
 	// 对一个已经被close过的channel进行接收操作依然可以接受到之前已经成功发送的数据；如果channel中已经没有数据的话将产生一个零值的数据。
 	// 如果有多个线程阻塞在ch上，且我们要让这些线程都退出，那么可以close(ch)，或者在ch上发送足够多的值使这些线程退出。
+
+	// 注意让主线程等待子线程执行完，如果主线程不等待，将会很快退出，子线程也将退出，如果子线程没有被调度执行，将会使我们观察到非预期的、
+	// 错误的结果。更严谨可以使用sync.WaitGroup。
+	time.Sleep(2 * time.Second)
 }
 
 func Test2(t *testing.T) {
-	// 不要因为受C的switch影响，go的switch每一个case默认都有一个break，除非显式指定fallthrough，并且只会继续执行下一个且仅一个case的代码。
+	// 不要因为受C的switch影响，go的switch每一个case默认都有一个break，除非显式指定fallthrough，
+	// 并且只会继续执行下一个且仅一个case的代码。
 	// 另外，不要因为select与switch相似的语法犯同样的错误，select中多个case不能共用一个代码块。
 	i := 1
 	switch i {
@@ -170,8 +173,9 @@ func TestGob(t *testing.T) {
 
 	// If a field has the zero value for its type (except for arrays; see above), it is omitted from the transmission.
 	// And "false" is zero value.
-	// 所以这个测试提升我们不要解码到同一个对象中，这样有些信息就会被忽略，又没有覆盖该对象的某些字段，
+	// 所以这个测试提示我们不要解码到同一个对象中，这样有些信息就会被忽略，又没有覆盖该对象的某些字段，
 	// 造成解码得到的信息混乱。
+	// 所以，不要为了所谓的“节省内存”而去尽量避免创建局部变量，而重复使用同一个变量，有时就会出现隐晦的错误。
 }
 
 func sendRPC() bool {
@@ -226,8 +230,8 @@ func TestVariableDelivery(t *testing.T) {
 		go func() {
 			time.Sleep(1 * time.Second)
 			fmt.Println(&ch1)
-		}() // 传引用变量ch1本身的引用，ch1的值的改变可以被所有引用ch1的线程看到。
-		// 于是结果就是三个线程引用同一个引用变量，即使用同一个channel实体。
+		}() // 传引用变量ch1本身的引用，ch1的值的改变可以被所有引用ch1的线程看/观察到。
+		// 于是结果就是三个线程引用同一个引用变量/标签，所以就使用的是同一个标签上的同一个channel实体。
 	}
 	time.Sleep(2 * time.Second)
 	// 0xc00000c028
@@ -235,7 +239,7 @@ func TestVariableDelivery(t *testing.T) {
 	// 0xc00000c028
 
 	for i := 0; i < 3; i++ {
-		ch2 := make(chan bool) // 新的实体，还有新的引用变量
+		ch2 := make(chan bool) // 新的实体，还有新的引用变量。
 		go func() {
 			time.Sleep(1 * time.Second)
 			fmt.Println(&ch2)
@@ -308,7 +312,8 @@ func TestGobDecode(t *testing.T) {
 	dec.Decode(&s1)        // decode时会读buf
 	fmt.Println(s1)        // "12345"
 	fmt.Println(buf.Len()) // 0
-	dec.Decode(&s2)
+
+	dec.Decode(&s2) // buf中的内容已被读出，“不存在了”
 	fmt.Println(s2) // ""
 }
 
@@ -415,7 +420,7 @@ func TestAppendCopy(t *testing.T) {
 	// a = [1 2 3 4 5 6 7], d = [4 5 6 7]
 	// a = [1 2 3 4 5 6 7], d = [1 2 4 5 6 7]
 
-	// 关于append还要注意一点：
+	// 关于append还要注意：
 	x := make([]int, 30) // make([]T, len)
 	fmt.Printf("x = %v\n", x)
 	x = append(x, 2)
@@ -431,6 +436,7 @@ func TestAppendCopy(t *testing.T) {
 	// y = []
 	// y = [2]
 
+	// 数组的默认初始化，即根据每个元素类型对其中每个元素进行默认初始化。
 	bools := make([]bool, 5)
 	fmt.Printf("bools = %v\n", bools)
 	// bools = [false false false false false]
@@ -495,4 +501,39 @@ func TestSelect(t *testing.T) {
 	// case <-rf.shutdown:
 	// 	return
 	// }
+}
+
+type testReference struct {
+	s string
+}
+
+func TestReference(t *testing.T) {
+	// 引用变量就像标签，贴在实体对象上。
+
+	data := map[rune]int{'a': 1, 'v': 3, 'd': 19}
+	ref := data // 浅复制
+	data['x'] = 8
+	println(data)
+	println(ref)
+	// 地址相同，引用变量就像贴在实体对象上的标签。
+	// 0xc0000b9f68
+	// 0xc0000b9f68
+
+	fmt.Printf("%v\n", data)
+	fmt.Printf("%v\n", ref)
+
+	// 多个对同一实体的引用，实体的修改可被这些引用观察(observe)到。
+	// map[97:1 100:19 118:3 120:8]
+	// map[97:1 100:19 118:3 120:8]
+
+	obj := testReference{"dsa"}
+	nonRef := obj // 与前面不同，这些不是引用变量，赋值是深拷贝。
+	p1 := &obj    // 如果想浅拷贝，可以使用指针。
+	println(&obj)
+	println(&nonRef)
+	println(p1)
+	nonRef.s = "xxx"
+	fmt.Printf("%v\n", obj)
+	fmt.Printf("%v\n", nonRef)
+	fmt.Printf("%v\n", *p1)
 }

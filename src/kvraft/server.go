@@ -8,7 +8,7 @@ import (
 	"sync"
 )
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -21,13 +21,20 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Operation string // Get Put or Append
+	Operation string // Get/Put/Append
 	Key       string
 	Value     string
-	ClientID  int32
+	ClerkID   int32
 	ReqID     int64
 }
 
+// Each of your key/value servers ("kvservers") will have an associated Raft peer.
+// Clerks send Put(), Append(), and Get() RPCs to the kvserver whose associated Raft is the leader.
+// The kvserver code submits the Put/Append/Get operation to Raft,
+// so that the Raft log holds a sequence of Put/Append/Get operations.
+// All of the kvservers execute operations from the Raft log in order,
+// applying the operations to their key/value databases;
+// the intent is for the servers to maintain identical replicas of the key/value database.
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -38,81 +45,79 @@ type KVServer struct {
 
 	// Your definitions here.
 	// **查看test_test.go中的测试代码**，键值的类型都是string。
-	kvs map[string]string
-	// Notify chan for each log index
-	notifyCh map[int]chan Op
-	// request records
-	requests map[int32]int64 // client -> last commited reqID
-	// KVServer对象生存期结束时终止它运行时开启的所有线程。
+	kvTable        map[string]string
+	duplicateTable map[int32]int64 // clerkID -> latest commited reqID
+
+	notify
+	cond *sync.Cond
+
 	shutdown chan struct{}
 }
 
-// call raft.Start to commit a command as log entry
-func (kv *KVServer) proposeCommand(cmd Op) (bool, Err) {
+type notify struct {
+	commandIndex int
+	op           Op
+}
+
+// 调用rf.Start()尝试将op复制到majority上后commit。
+func (kv *KVServer) proposeOp(op Op) bool {
 	kv.mu.Lock()
-	logIndex, _, isLeader := kv.rf.Start(cmd)
+	commandIndex, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
-		kv.mu.Unlock()
-		return false, ErrNotLeader
-	}
-	ch, ok := kv.notifyCh[logIndex]
-	if !ok {
-		ch = make(chan Op, 1) // buffered channel，避免写入阻塞。
-		kv.notifyCh[logIndex] = ch
+		return false
 	}
 	kv.mu.Unlock()
-	DPrintf("[KVServer %d proposeCommand] cmd = %+v, logIndex = %d", kv.me, cmd, logIndex)
+	DPrintf("[KVServer %d proposeOp] op = %+v, commandIndex = %d", kv.me, op, commandIndex)
 
-	// check
-	if ch == nil {
-		panic("FATAL: chan is nil")
-	}
+	// Hint: After calling Start(), your kvservers will need to wait for Raft to complete agreement.
 
-	// wait on ch forever, because:
-	// If I lose leadership before commit, may be partioned
-	// I can't response, so wait until partion healed.
-	// Eventually a log will be commited on index, then I'm
-	// awaken, but cmd1 is different from cmd, return failed
-	// to client.
-	// If client retry another leader when I waiting, no matter.
-	select {
-	case cmd1 := <-ch:
-		return cmd1 == cmd, OK
-	case <-kv.shutdown:
-		return false, ErrStaleLeader
+	// Hint: Your solution needs to handle the case in which a leader has called Start() for a Clerk's RPC,
+	// but loses its leadership before the request is committed to the log.
+	// In this case you should arrange for the Clerk to re-send the request to other servers
+	// until it finds the new leader. One way to do this is for the server to detect that it has lost leadership,
+	// by noticing that a different request has appeared at the index returned by Start(),
+	// or that Raft's term has changed. If the ex-leader is partitioned by itself,
+	// it won't know about new leaders; but any client in the same partition won't be able to talk to
+	// a new leader either, so it's OK in this case for the server and client to wait indefinitely
+	// until the partition heals.
+
+	// guide:
+	// how do you know when a client operation has completed? In the case of no failures,
+	// this is simple – you just wait for the thing you put into the log to come back out (i.e., be passed to apply()).
+	// When that happens, you return the result to the client. However, what happens if there are failures?
+	// For example, you may have been the leader when the client initially contacted you,
+	// but someone else has since been elected, and the client request you put in the log has been discarded.
+	// Clearly you need to have the client try again, but how do you know when to tell them about the error?**
+	//
+	// One simple way to solve this problem is to record where in the Raft log the client’s operation appears
+	// when you insert it. Once the operation at that index is sent to apply(),
+	// you can tell whether or not the client’s operation succeeded based on whether the operation
+	// that came up for that index is in fact the one you put there. If it isn’t,
+	// a failure has happened and an error can be returned to the client.
+	kv.cond.L.Lock()
+	for commandIndex != kv.commandIndex {
+		kv.cond.Wait()
 	}
+	// 如果不相同，则当前KVServer对应的Raft是stale leader，相同位置上的LogEntey被覆盖了，这时让RPC返回错误，让Clerk重发。
+	result := kv.op == op
+	kv.cond.L.Unlock()
+	return result
 }
 
-// check if repeated request
-func (kv *KVServer) isDuplicated(clientID int32, reqID int64) bool {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	maxSeenReqID, ok := kv.requests[clientID]
-	if ok {
-		return reqID <= maxSeenReqID
+// 循环该请求的操作是否已经执行过。
+func (kv *KVServer) execute(clerkID int32, reqID int64) bool {
+	// 约定caller持锁调用。
+	latestReqID, ok := kv.duplicateTable[clerkID]
+	if ok && reqID <= latestReqID {
+		return false // duplicate request，该操作已经执行过了，不再执行。
 	}
-	return false
-}
-
-// true if update success, imply nonrepeat request can be applied to state machine: eg, data field
-func (kv *KVServer) updateIfNotDuplicated(clientID int32, reqID int64) bool {
-	// must hold lock outside
-
-	maxSeenReqID, ok := kv.requests[clientID]
-	if ok {
-		if reqID <= maxSeenReqID {
-			return false
-		}
-	}
-
-	kv.requests[clientID] = reqID
-	return true
+	kv.duplicateTable[clerkID] = reqID // 新的request。
+	return true                        // 非重复请求，执行操作。
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	DPrintf("[KVServer %d Get] RPC handler, args = %+v", kv.me, *args)
-	// check if leader, useless but efficient
 	_, isLeader := kv.rf.GetState()
 	if !isLeader {
 		reply.WrongLeader = true
@@ -122,16 +127,15 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	reply.Err = ""
 	reply.WrongLeader = false
-	reply.ClientID = args.ClientID
-	reply.RepID = args.ReqID
 
-	cmd := Op{Operation: "Get", Key: args.Key, Value: "", ClientID: args.ClientID, ReqID: args.ReqID}
+	op := Op{Operation: "Get", Key: args.Key, Value: "", ClerkID: args.ClerkID, ReqID: args.ReqID}
 
-	// try commit cmd to raft log
-	succ, err := kv.proposeCommand(cmd)
+	// try commit operation to raft log
+	succ := kv.proposeOp(op)
+
 	if succ {
 		kv.mu.Lock()
-		if v, ok := kv.kvs[args.Key]; ok {
+		if v, ok := kv.kvTable[args.Key]; ok {
 			reply.Value = v
 		} else {
 			reply.Value = ""
@@ -140,7 +144,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		kv.mu.Unlock()
 	} else {
 		reply.WrongLeader = true
-		reply.Err = err
+		reply.Err = ErrStaleLeader // 或ErrWrongLeader。
 	}
 }
 
@@ -151,29 +155,17 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.WrongLeader = true
 		reply.Err = ErrNotLeader
 		return
-	} else if args.Op != "Put" && args.Op != "Append" {
-		reply.Err = ErrInvalidOp
-		return
-	}
-
-	// check if repeated request, useless but efficient
-	duplicate := kv.isDuplicated(args.ClientID, args.ReqID)
-	if duplicate {
-		reply.Err = ErrDuplicateReq
-		return
 	}
 
 	reply.WrongLeader = false
 	reply.Err = ""
-	reply.ClientID = args.ClientID
-	reply.RepID = args.ReqID
 
-	cmd := Op{Operation: args.Op, Key: args.Key, Value: args.Value, ClientID: args.ClientID, ReqID: args.ReqID}
+	op := Op{Operation: args.Op, Key: args.Key, Value: args.Value, ClerkID: args.ClerkID, ReqID: args.ReqID}
 
-	succ, err := kv.proposeCommand(cmd)
+	succ := kv.proposeOp(op)
 	if !succ {
 		reply.WrongLeader = true
-		reply.Err = err
+		reply.Err = ErrStaleLeader // 或ErrWrongLeader。
 	}
 }
 
@@ -190,7 +182,8 @@ func (kv *KVServer) Kill() {
 	DPrintf("[KVServer %d Kill]", kv.me)
 }
 
-func (kv *KVServer) readApplyCh() {
+// 将已commit的LogEntry按log序执行应用到状态机上。
+func (kv *KVServer) apply() {
 	// 这个线程的生存期与kv server的生存期一样长。
 	var op Op
 	var applyMsg raft.ApplyMsg
@@ -198,72 +191,46 @@ func (kv *KVServer) readApplyCh() {
 		select {
 		case applyMsg = <-kv.applyCh:
 		case <-kv.shutdown:
-			DPrintf("[KVServer %d readApplyCh] shutdown", kv.me)
 			return
 		}
 		if !applyMsg.CommandValid {
 			// 该KVServer关联的Raft server的快照被leader覆盖了，所以也要更新Raft server关联的KVServer的状态。
-			DPrintf("[KVServer %d readApplyCh] update snapshot, kv.kvs = %+v", kv.me, kv.kvs)
-			kv.kvs = applyMsg.StateMachineState
+			kv.kvTable = applyMsg.KVTable
+			kv.duplicateTable = applyMsg.DuplicateTable
+			DPrintf("[KVServer %d apply] update snapshot, kv.kvTable=%v, kv.duplicateTable=%v", kv.me, kv.kvTable, kv.duplicateTable)
 			continue
 		}
 		op, _ = (applyMsg.Command).(Op)
 
 		kv.mu.Lock()
-		// Follower & Leader: try apply to state machine, fail if duplicated request.
-		// 实现linearizability，每一个cmd执行且仅执行一次。
-		update := kv.updateIfNotDuplicated(op.ClientID, op.ReqID)
-		if update {
+		if kv.execute(op.ClerkID, op.ReqID) {
 			if op.Operation == "Put" {
-				kv.kvs[op.Key] = op.Value
-				DPrintf("[KVServer %d readApplyCh] apply for client %d PUT [%s, %s], CommandIndex %d",
-					kv.me, op.ClientID, op.Key, op.Value, applyMsg.CommandIndex)
+				kv.kvTable[op.Key] = op.Value
+				DPrintf("[KVServer %d apply] apply for clerk %d PUT [%s, %s], CommandIndex %d",
+					kv.me, op.ClerkID, op.Key, op.Value, applyMsg.CommandIndex)
 			} else if op.Operation == "Append" {
-				kv.kvs[op.Key] += op.Value
-				DPrintf("[KVServer %d readApplyCh] apply for client %d APPEND [%s, %s], CommandIndex %d",
-					kv.me, op.ClientID, op.Key, kv.kvs[op.Key], applyMsg.CommandIndex)
+				kv.kvTable[op.Key] += op.Value
+				DPrintf("[KVServer %d apply] apply for clerk %d APPEND [%s, %s], CommandIndex %d",
+					kv.me, op.ClerkID, op.Key, kv.kvTable[op.Key], applyMsg.CommandIndex)
 			} else {
 				// Do nothing for Get
-				DPrintf("[KVServer %d readApplyCh] apply for client %d Get [%s, %s], CommandIndex %d",
-					kv.me, op.ClientID, op.Key, kv.kvs[op.Key], applyMsg.CommandIndex)
+				DPrintf("[KVServer %d apply] apply for clerk %d Get [%s, %s], CommandIndex %d",
+					kv.me, op.ClerkID, op.Key, kv.kvTable[op.Key], applyMsg.CommandIndex)
 			}
 		}
 
-		ch, ok := kv.notifyCh[applyMsg.CommandIndex]
-		if ok {
-			// ch是带缓冲的channel，这里写ch一般不会阻塞。
-			ch <- op
-		}
+		kv.commandIndex = applyMsg.CommandIndex
+		kv.op = op
+		kv.cond.Broadcast()
 
-		// `kv.rf.persister.RaftStateSize()`，因为persister成员并没有导出raft包，所以这一句是错误的。
-		// 给Raft添加一个导出的函数，间接调用rf.persister.RaftStateSize()即可。
 		if kv.maxraftstate > 0 && kv.rf.RaftStateSize() >= kv.maxraftstate {
-			DPrintf("[KVServer %d readApplyCh] make snapshot, kv.maxraftstate = %d, raft log size %d",
+			DPrintf("[KVServer %d apply] make snapshot, kv.maxraftstate = %d, raft log size %d",
 				kv.me, kv.maxraftstate, kv.rf.RaftStateSize())
-			// 为了避免fatal error: concurrent map iteration and map write，
-			// 这里粗糙地处理为传入kv.kvs的一个副本，注意对map要深拷贝，而不是拷贝指向底层map的引用。
-			// 当然，另一个避免的方式是串行调用kv.rf.MakeSnapshotAndPersist()。
-			// go kv.rf.MakeSnapshotAndPersist(applyMsg.CommandIndex, simpleMapDeepCopy(kv.kvs), simpleMapDeepCopy1(kv.requests))
-			kv.rf.MakeSnapshotAndPersist(applyMsg.CommandIndex, simpleMapDeepCopy(kv.kvs), simpleMapDeepCopy1(kv.requests))
+			// 串行持久化，等到持久化当前状态机状态完成后，才可以继续修改状态机。
+			kv.rf.MakeSnapshotAndPersist(applyMsg.CommandIndex)
 		}
 		kv.mu.Unlock()
 	}
-}
-
-func simpleMapDeepCopy(m map[string]string) map[string]string {
-	r := make(map[string]string)
-	for k, v := range m {
-		r[k] = v
-	}
-	return r
-}
-
-func simpleMapDeepCopy1(m map[int32]int64) map[int32]int64 {
-	r := make(map[int32]int64)
-	for k, v := range m {
-		r[k] = v
-	}
-	return r
 }
 
 //
@@ -295,16 +262,22 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-	kv.kvs = make(map[string]string)
-	kv.notifyCh = make(map[int]chan Op)
-	kv.requests = make(map[int32]int64)
+	// kv.kvTable = make(map[string]string) // lab3A
+	// kv.duplicateTable = make(map[int32]int64)
+
+	kv.commandIndex = -1
+	kv.cond = sync.NewCond(new(sync.Mutex))
+
 	kv.shutdown = make(chan struct{})
 
 	// restart? load persistent state if any.
-	kv.rf.LoadStateMachineState(&kv.kvs, &kv.requests)
+	// Hint: Your kvserver must be able to detect duplicated operations in the log across checkpoints,
+	// so any state you are using to detect them must be included in the snapshots.
+	// Remember to capitalize all fields of structures stored in the snapshot.
+	kv.kvTable, kv.duplicateTable = kv.rf.LoadSnapshot()
 
 	// single goroutine which keeps reading applyCh
-	go kv.readApplyCh()
+	go kv.apply()
 
 	return kv
 }

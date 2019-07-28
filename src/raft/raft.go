@@ -41,6 +41,10 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+
+	// lab3B, snapshot
+	KVTable        map[string]string
+	DuplicateTable map[int32]int64
 }
 
 const (
@@ -87,12 +91,27 @@ type Raft struct {
 	leaderEventLoopDone chan struct{} // 当leader退回follower时，关闭leaderEventLoop()及相关线程
 	timeout             *time.Timer   // 计时器
 	applyReq            chan struct{} // 发送server当前的lastApplied给writeApplyCh()线程
+
+	// lab3B
+	lastIncludedIndex int
+	lastIncludedTerm  int
+
+	// 以下两个字段组成snapshot。
+	// 引用变量，贴在该Raft关联的KVServer的状态实体上，KVServer状态的改变可被该引用变量observe到。
+	kvTable map[string]string
+	// Hint: Your kvserver must be able to detect duplicated operations in the log across checkpoints/crash,
+	// so any state you are using to detect them must be included in the snapshots.
+	// Remember to capitalize all fields of structures stored in the snapshot.
+	// 考虑这样一种情况，clerk1请求PUT 8:x 8 5 y，Raft复制到majority后，commit，KVServer应用到状态机，但在响应给clerk1前crash了，
+	// 之后恢复，clerk1重复同一个请求，如果快照中没有包含对clerk已执行过的请求的记录，那么恢复后的KVServer就会再将该重复的Op复制到
+	// majority后commit后再次执行，违背了linearizability。所以snapshot中要包含用于检测重复请求的内容，避免重复执行同样的Op。
+	duplicateTable map[int32]int64
 }
 
 // LogEntry ...
-// 类型名大写开头、驼峰
+// 类型名大写开头、驼峰。
 type LogEntry struct {
-	Index   int // 非必要，只是调试会容易
+	Index   int // 非必要，只是方便调试。
 	Term    int
 	Command interface{}
 }
@@ -110,6 +129,103 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isLeader
 }
 
+func (rf *Raft) RaftStateSize() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	return rf.persister.RaftStateSize()
+
+	// 2019/07/28 09:16:59 [KVServer 2 apply] apply for client 17 Get [15, x 15 0 yx 15 1 yx 15 2 yx 15 3 yx 15 4 yx 15 5 yx 15 6 y], CommandIndex 261
+	// 2019/07/28 09:16:59 [KVServer 2 apply] make snapshot, kv.maxraftstate = 1000, raft log size 1153
+	// 2019/07/28 09:16:59 [KVServer 2 apply] apply for client 21 Get [19, x 19 0 yx 19 1 yx 19 2 yx 19 3 yx 19 4 yx 19 5 yx 19 6 yx 19 7 yx 19 8 y], CommandIndex 262
+	// 2019/07/28 09:16:59 [KVServer 2 apply] make snapshot, kv.maxraftstate = 1000, raft log size 1118
+	// 2019/07/28 09:16:59 [KVServer 2 apply] apply for client 8 Get [5, x 5 0 yx 5 1 yx 5 2 yx 5 3 yx 5 4 y], CommandIndex 263
+	// 2019/07/28 09:16:59 [KVServer 2 apply] make snapshot, kv.maxraftstate = 1000, raft log size 1083
+	// 2019/07/28 09:16:59 [KVServer 2 apply] apply for client 2 Get [9, x 9 0 yx 9 1 yx 9 2 yx 9 3 yx 9 4 y], CommandIndex 264
+	// 2019/07/28 09:16:59 [KVServer 2 apply] make snapshot, kv.maxraftstate = 1000, raft log size 1049
+	// 出现这种情况是因为，rf.logs中有大量未commit的LogEntry，而快照只包含已commit和apply的LogEntry，
+	// 持久化时会连这些未commit的LogEntry一起持久化，这就导致上述日志描述的情况，即每一次制作快照由于rf.logs存在
+	// 大量未commit的LogEntry而无法有效减小rf.logs的大小，导致频繁制作快照。
+	// 这种情况除了降低算法运行效率外，对算法的正确性并没有什么影响。
+	// 这种情况可以通过适当增大kv.maxraftstate来缓解。
+}
+
+// 注意，该函数必须由KVServer串行调用，直到这一刻的状态机的状态持久化好后，才可以继续修改状态机。
+// 如果要让KVServer并行调用该函数，需要传递给该函数一个状态机状态的副本。
+func (rf *Raft) MakeSnapshotAndPersist(commandIndex int) {
+	// 加锁调用rf.persist()，这样rf.persistRaftStateAndStateMachineState()在读取Raft的状态时才不会中间其中某一个状态被修改，
+	// 造成持久化的各状态不一致。而且要删除rf.logs的一些LogEntry，而且要更新rf.commitIndex等，所以更要加锁，让这个操作变成原子的，
+	// 让这块代码成为串行执行的一片，否则会出现比如我们删完了rf.logs，即将修改rf.nextIndex之前，其它线程
+	// 使用了未修改的rf.nextIndex访问rf.logs，这时可能导致数组访问越界错误。
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	relativeCommandIndex := rf.relativeIndex(commandIndex)
+
+	if relativeCommandIndex >= len(rf.logs) || relativeCommandIndex <= 0 {
+		panic("relativeCommandIndex >= len(rf.logs) || relativeCommandIndex <= 0")
+	}
+
+	rf.lastIncludedIndex = commandIndex
+	rf.lastIncludedTerm = rf.logs[relativeCommandIndex].Term
+
+	if rf.commitIndex < rf.lastIncludedIndex || rf.lastApplied < rf.lastIncludedIndex {
+		// 被包含在快照中的LogEntry必然是已被commit和apply的。
+		panic("rf.commitIndex < rf.lastIncludedIndex || rf.lastApplied < rf.lastIncludedIndex")
+	}
+
+	a := []LogEntry{}
+	a = append(a, rf.logs[relativeCommandIndex+1:]...)
+	rf.logs = append(rf.logs[:1], a...)
+
+	rf.persistRaftStateAndStateMachineState()
+}
+
+// 一个原则是，只有在访问rf.logs，才需要计算出相对下标。
+// 其它的一些Raft状态仍使用单调递增的绝对下标，注意不能减小这些字段，这样就丢失了一些信息。
+// 编辑器正则搜索`rf.logs\[.*\]`。
+func (rf *Raft) relativeIndex(absIndex int) int {
+	return absIndex - rf.lastIncludedIndex
+}
+
+func (rf *Raft) absIndex(relativeIndex int) int {
+	return relativeIndex + rf.lastIncludedIndex
+}
+
+func (rf *Raft) persistRaftStateAndStateMachineState() {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.kvTable)
+	// Hint: Your kvserver must be able to detect duplicated operations in the log across checkpoints,
+	// so any state you are using to detect them must be included in the snapshots.
+	// Remember to capitalize all fields of structures stored in the snapshot.
+	e.Encode(rf.duplicateTable)
+	rf.persister.SaveStateAndSnapshot(rf.encode(), w.Bytes())
+}
+
+// Hint: Your kvserver must be able to detect duplicated operations in the log across checkpoints,
+// so any state you are using to detect them must be included in the snapshots.
+// Remember to capitalize all fields of structures stored in the snapshot.
+func (rf *Raft) LoadSnapshot() (map[string]string, map[int32]int64) {
+	data := rf.persister.ReadSnapshot()
+	kvTable := make(map[string]string)
+	duplicateTable := make(map[int32]int64)
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		rf.kvTable = kvTable // Raft保留一份贴在其关联的KVServer的状态实体上的标签，KVServer状态的改变可被该引用变量看到。
+		rf.duplicateTable = duplicateTable
+		return kvTable, duplicateTable
+	}
+	d := labgob.NewDecoder(bytes.NewBuffer(data))
+	if d.Decode(&kvTable) != nil || d.Decode(&duplicateTable) != nil {
+		DPrintf("PPPP[%s %d/%d] LoadSnapshot failed", stateStr[rf.state], rf.me, rf.currentTerm)
+		panic("LoadSnapshot failed")
+	}
+	rf.kvTable = kvTable // Raft保留一份贴在其关联的KVServer的状态实体上的标签，KVServer状态的改变可被该引用变量看到。
+	rf.duplicateTable = duplicateTable
+	DPrintf("PPPP[%s %d/%d] LoadSnapshot succ", stateStr[rf.state], rf.me, rf.currentTerm)
+	return kvTable, duplicateTable
+}
+
 //
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
@@ -125,6 +241,10 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 
+	rf.persister.SaveRaftState(rf.encode())
+}
+
+func (rf *Raft) encode() []byte {
 	// 该函数有caller持锁调用，避免下面三个`e.Encode()`调用被调度，造成要持久化的状态被破坏。
 	w := new(bytes.Buffer)
 	// Will write to w, 注意传递的是指针。
@@ -132,9 +252,10 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.logs)
-	rf.persister.SaveRaftState(w.Bytes())
-	// DPrintf("PPPP[%s %d/%d]: persist succ, votedFor=%d, logs=%v",
-	// 	stateStr[rf.state], rf.me, rf.currentTerm, rf.votedFor, rf.logs)
+	// lab3
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
+	return w.Bytes()
 }
 
 //
@@ -163,16 +284,21 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var logs []LogEntry
+	// lab3
+	var lastIncludedIndex int
+	var lastIncludedTerm int
 	// Decode记得传入地址，这样才能写入实参本身，而不是实参的副本
-	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&logs) != nil {
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&logs) != nil || d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil {
 		DPrintf("PPPP[%s %d/%d]: readPersist failed", stateStr[rf.state], rf.me, rf.currentTerm)
 		panic("readPersist failed")
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.logs = logs
-		DPrintf("PPPP[%s %d/%d]: readPersist succ, votedFor=%d, logs=%v",
-			stateStr[rf.state], rf.me, rf.currentTerm, rf.votedFor, rf.logs)
+		rf.lastIncludedIndex = lastIncludedIndex
+		rf.lastIncludedTerm = lastIncludedTerm
+		DPrintf("PPPP[%s %d/%d]: readPersist succ, votedFor=%d, logs=%v, lastIncludedIndex=%v, lastIncludedTerm=%v",
+			stateStr[rf.state], rf.me, rf.currentTerm, rf.votedFor, rf.logs, rf.lastIncludedIndex, rf.lastIncludedTerm)
 	}
 }
 
@@ -259,8 +385,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Raft uses the voting process to prevent a candidate from
 	// winning an election unless its log contains all committed entries.
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateID { // 这个条件隐含表示，如果当前server也是candidate，它不会投给请求的candidate。
-		nLog := len(rf.logs)
-		lastLogTerm := rf.logs[nLog-1].Term
+		// nLog := len(rf.logs)
+		nLog := rf.absIndex(len(rf.logs))
+		lastLogTerm := rf.logs[rf.relativeIndex(nLog-1)].Term
 		// up-to-date的定义如下：
 		// If the logs have last entries with different terms, then
 		// the log with the later term is more up-to-date.
@@ -308,6 +435,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	reply.Success = false
 
+	// DPrintf("[%s %d/%d]: AppendEntries RPC handler, args=%+v, rf.lastIncludeIndex=%d, rf.commitIndex=%d",
+	// 	stateStr[rf.state], rf.me, rf.currentTerm, *args, rf.lastIncludedIndex, rf.commitIndex)
+
 	// leader收到AppendEntries RPC该怎么办？
 	// 首先，这两个leader的term肯定是不同的，因为前面我们有election restriction保证一个term只能有一个leader，
 	// 或者没有leader，这样只需让较小term的leader转换为follower即可。
@@ -343,7 +473,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// up through the given index. §5.3
 	// XXX 每一次，即便仅仅就是heartbeat，没有携带Entries，也要进行AppendEntries consistency check
 	// 确保自己的log与leader相一致，且做到不一致时及时通知leader更新自己的log
-	nLogs := len(rf.logs)
+	// nLogs := len(rf.logs)
+	nLogs := rf.absIndex(len(rf.logs))
+	relativePrevLogIndex := rf.relativeIndex(args.PrevLogIndex)
+	// lab 3B
+	if args.PrevLogIndex <= rf.lastIncludedIndex {
+		// 注意，被做成snapshot的LogEntry必然是已经被commit和apply的，被commit，意味着该LogEntry已被复制到majority中。
+		// 即log中已commit的部分在majority中是一致的，那么如果args.PrevLogIndex指向的LogEntry已被当前follower制作成快照，
+		// 那么也就隐含的通过了这个consistency check，保证了Log Matching Property，保证了该follower与leader的log前部分是一致的。
+		goto passConsistencyCheck
+	}
 	// 短路操作，确保不会数组访问越界，下面是没有优化时，一次只反应一个LogEntry不一致给leader。
 	// if nLogs <= args.PrevLogIndex || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
 	// 	return
@@ -355,34 +494,42 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.ConflictIndex = nLogs
 		reply.ConflictTerm = -1
 		return
-	} else if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+	} else if rf.logs[relativePrevLogIndex].Term != args.PrevLogTerm {
 		// If a follower does have prevLogIndex in its log, but the term does not match, it should return
-		reply.ConflictTerm = rf.logs[args.PrevLogIndex].Term
+		reply.ConflictTerm = rf.logs[relativePrevLogIndex].Term
 		// and then search its log for the first index whose entry has term equal to conflictTerm.
-		for i := 0; i < nLogs; i++ {
+		for i := 1; i < rf.relativeIndex(nLogs); i++ {
 			if rf.logs[i].Term == reply.ConflictTerm {
-				reply.ConflictIndex = i
+				// reply.ConflictIndex = i
+				reply.ConflictIndex = rf.absIndex(i) // lab3B，除非访问rf.logs，Raft的状态仍然使用单调递增的绝对下标。
 				break
 			}
 		}
 		return
 	}
-
+passConsistencyCheck:
 	// 3. If an existing entry conflicts with a new one (same index
 	// but different terms), delete the existing entry and all that follow it (§5.3)
 	// 4. Append any new entries not already in the log
 	nEntries := len(args.Entries)
 	if nEntries > 0 {
 		appendIndex := args.PrevLogIndex + 1
+		relativeAppendIndex := rf.relativeIndex(appendIndex)
 		for i, e := range args.Entries {
+			if appendIndex+i <= rf.lastIncludedIndex {
+				// lab3B，leader发过来的LogEntry已被包含在快照中，无需添加到logs中。
+				continue
+			}
 			if appendIndex+i >= nLogs {
-				rf.logs = append(rf.logs, args.Entries[i:]...) // 无冲突，但logs中没有，append。
+				// 无冲突，但logs中没有，append。
+				rf.logs = append(rf.logs, args.Entries[i:]...)
 				break
-			} else if e.Term != rf.logs[appendIndex+i].Term {
-				rf.logs = append(rf.logs[:appendIndex+i], args.Entries[i:]...) // 有冲突，截断后append。
+			} else if e.Term != rf.logs[relativeAppendIndex+i].Term {
+				// 有冲突，截断后append。
+				rf.logs = append(rf.logs[:relativeAppendIndex+i], args.Entries[i:]...)
 				break
 			} else {
-				// e.Term == rf.logs[appendIndex+i].Term
+				// e.Term == rf.logs[relativeAppendIndex+i].Term
 				// 同一位置相同term，可能当前RPC请求是之前处理过的RPC请求的leader重发的副本，
 				// 比如网络延迟，leader先后发送了两个携带x的参数相同的RPC，此时因为是同一个LogEntry故不需要做什么。
 			}
@@ -392,7 +539,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// This is because we could be receiving an outdated AppendEntries RPC from the leader,
 		// and truncating the log would mean “taking back” entries that we may have already
 		// told the leader that we have in our log.
-		// rf.logs = append(rf.logs[:appendIndex], args.Entries...) // 总是截断后插入。
+		// rf.logs = append(rf.logs[:relativeAppendIndex], args.Entries...) // 总是截断后插入。
 
 		rf.persist()
 	}
@@ -402,9 +549,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 也不能直接设置commitIndex=index of last new entry，这样若leaderCommit<index of last new entry，
 	// 就导致该follower擅自commit了leader还未commit的LogEntry，并且这些LogEntry还可能与leader不一样。
 	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = min(args.LeaderCommit, len(rf.logs)-1) // 这里不能再用局部变量nlogs了，因为它可能存放的是旧值，除非给它赋新值。
+		rf.commitIndex = min(args.LeaderCommit, rf.absIndex(len(rf.logs)-1)) // 这里不能再用局部变量nlogs了，因为它可能存放的是旧值，除非给它赋新值。
 		DPrintf("FFFF[%s %d/%d]: commitIndex have updated to %d, have commit %v\n",
-			stateStr[rf.state], rf.me, rf.currentTerm, rf.commitIndex, rf.logs[:rf.commitIndex+1])
+			stateStr[rf.state], rf.me, rf.currentTerm, rf.commitIndex, rf.logs[:rf.relativeIndex(rf.commitIndex+1)])
 	}
 
 	// All Servers:
@@ -417,6 +564,85 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 }
 
+type InstallSnapshotArgs struct {
+	Term              int // leader’s term
+	LeaderID          int // so follower can redirect clients
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	// 以下两个字段组成snapshot。
+	KVTable        map[string]string
+	DuplicateTable map[int32]int64
+}
+
+type InstallSnapshotReply struct {
+	Term int // currentTerm, for leader to update itself
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+
+	// 1. Reply immediately if term < currentTerm
+	if args.Term < rf.currentTerm {
+		return
+	} else if args.Term > rf.currentTerm || (rf.state == candidate && args.Term == rf.currentTerm) {
+		DPrintf("[%s %d/%d] InstallSnapshot RPC handler, come across newer term %d, back to follower",
+			stateStr[rf.state], rf.me, rf.currentTerm, args.Term)
+		// If RPC request or response contains term T > currentTerm:
+		// set currentTerm = T, convert to follower (§5.1)
+		rf.currentTerm = args.Term
+		if rf.state == follower {
+			rf.votedFor = -1
+		} else {
+			rf.becomeFollower()
+		}
+		rf.persist()
+	}
+
+	// 2. Create new snapshot file
+	// 5. Save snapshot file, discard any existing or partial snapshot with a smaller index
+	// 被制作成镜像的LogEntry必然是已经commit的，已经apply的。
+	rf.kvTable = args.KVTable
+	rf.duplicateTable = args.DuplicateTable
+	rf.lastIncludedIndex = args.LastIncludedIndex
+	rf.lastIncludedTerm = args.LastIncludedTerm
+
+	relativeLastIncludeIndex := rf.relativeIndex(rf.lastIncludedIndex)
+	if relativeLastIncludeIndex < len(rf.logs) && rf.logs[relativeLastIncludeIndex].Term == rf.lastIncludedTerm { // 短路操作确保数组访问不越界。
+		// 6. If existing log entry has same index and term as snapshot’s
+		// last included entry, retain log entries following it and reply
+		a := []LogEntry{}
+		a = append(a, rf.logs[relativeLastIncludeIndex+1:]...)
+		rf.logs = append(rf.logs[:1], a...)
+	} else {
+		// 7. Discard the entire log
+		rf.logs = rf.logs[:1] // 只保留哨兵。
+	}
+
+	rf.persistRaftStateAndStateMachineState()
+
+	// 更新commitIndex和lastApplied。
+	if rf.commitIndex < rf.lastIncludedIndex {
+		rf.commitIndex = rf.lastIncludedIndex
+		// apply
+		// 不要持锁执行可能阻塞的操作。
+		// go func() {
+		// 	rf.applyReq <- struct{}{}
+		// }()
+		// 不需要apply，直接更新lastApplied即可，因为快照中的LogEntry都已执行，所以无需重复执行。
+		rf.lastApplied = rf.lastIncludedIndex
+	} else if rf.lastApplied < rf.lastIncludedIndex {
+		rf.lastApplied = rf.lastIncludedIndex
+	}
+
+	// 8. Reset state machine using snapshot contents (and load snapshot’s cluster configuration)
+	// 因为该raft server的snapshot已经被更新，要重新替换该raft关联的KVServer状态机的状态。
+	// set CommandValid to false for these other uses.
+	rf.applyCh <- ApplyMsg{CommandValid: false, KVTable: rf.kvTable, DuplicateTable: rf.duplicateTable}
+}
+
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
@@ -424,6 +650,11 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
 }
 
@@ -451,16 +682,18 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, -1, false
 	}
 
+	// index := len(rf.logs)
+	index := rf.absIndex(len(rf.logs))
+	term := rf.currentTerm
+	isLeader := true
+
 	// Leaders:
 	// • If command received from client: append entry to local log,
 	// respond after entry applied to state machine (§5.3)
-	rf.logs = append(rf.logs, LogEntry{Index: len(rf.logs), Term: rf.currentTerm, Command: command})
+	// rf.logs = append(rf.logs, LogEntry{Index: index, Term: term, Command: command})
+	rf.logs = append(rf.logs, LogEntry{Index: index, Term: term, Command: command})
 	rf.persist()
 	DPrintf("[%s %d/%d]: receive client request %v, my logs %v", stateStr[rf.state], rf.me, rf.currentTerm, command, rf.logs)
-
-	index := len(rf.logs) - 1
-	term := rf.currentTerm
-	isLeader := true
 
 	// 我们不单独拿出leaderEventLoop之外的线程进行agreement，而是利用leaderEventLoop进行heartbeat的同时进行agreement。
 	// 这很关键，因为只有leaderEventLoop这个线程在做这个事情，可以避免许多隐晦的错误，也不需要关注繁琐的同步问题，容易管理，而且“物尽其用”。
@@ -538,7 +771,8 @@ func (rf *Raft) becomeLeader() {
 		if i == rf.me {
 			continue
 		}
-		rf.nextIndex[i] = len(rf.logs)
+		// rf.nextIndex[i] = len(rf.logs)
+		rf.nextIndex[i] = rf.absIndex(len(rf.logs))
 	}
 	// 上面一些初始化条件准备好了后，才开启leaderEventLoop()。
 	// 注意，不能把下面的语句放在该函数的第一行，因为一些条件如nextIndex没有初始化好，就会出现一些隐晦的错误。
@@ -563,8 +797,10 @@ func (rf *Raft) electionEventLoop() {
 			rf.votedFor = rf.me  // Vote for self
 			rf.resetTimeout()    // Reset election timer
 			rf.persist()
+			// args := RequestVoteArgs{Term: rf.currentTerm, CandidateID: rf.me,
+			// 	LastLogIndex: len(rf.logs) - 1, LastLogTerm: rf.logs[len(rf.logs)-1].Term}
 			args := RequestVoteArgs{Term: rf.currentTerm, CandidateID: rf.me,
-				LastLogIndex: len(rf.logs) - 1, LastLogTerm: rf.logs[len(rf.logs)-1].Term}
+				LastLogIndex: rf.absIndex(len(rf.logs) - 1), LastLogTerm: rf.logs[len(rf.logs)-1].Term}
 			rf.mu.Unlock()
 			DPrintf("[%s %d/%d]: timeout, start the election", stateStr[rf.state], rf.me, rf.currentTerm)
 			// Send RequestVote RPCs to all other servers
@@ -668,12 +904,41 @@ func (rf *Raft) sendAndWaitAppendEntriesRPC(server int) {
 	if rf.nextIndex[server] < 1 {
 		panic("break invariant: rf.nextIndex[i] >= 1")
 	}
+
+	if rf.nextIndex[server] <= rf.lastIncludedIndex {
+		// rf.nextIndex[server]指向的LogEntry已经被做成快照了。
+
+		// lab 3B
+		// 7 Log compaction
+		// Although servers normally take snapshots independently,
+		// the leader must occasionally send snapshots to followers that lag behind.
+		// This happens when the leader has already discarded the next log entry that it needs to
+		// send to a follower. Fortunately, this situation is unlikely in normal operation:
+		// a follower that has kept up with the leader would already have this entry.
+		// However, an exceptionally slow follower or a new server joining
+		// the cluster (Section 6) would not. The way to bring such a follower
+		// up-to-date is for the leader to send it a snapshot over the network.
+
+		// go rf.sendAndWaitInstallSnapshotRPC(server)
+		// XXX 这里没必要再开另一个线程，直接在这个线程执行就行了。
+		rf.mu.Unlock()
+		// 把剩下的工作交给sendAndWaitInstallSnapshotRPC()。
+		rf.sendAndWaitInstallSnapshotRPC(server)
+		return
+	}
+
+	relativeNextIndex := rf.relativeIndex(rf.nextIndex[server])
 	args := AppendEntriesArgs{Term: rf.currentTerm, LeaderID: rf.me,
-		PrevLogIndex: rf.nextIndex[server] - 1, PrevLogTerm: rf.logs[rf.nextIndex[server]-1].Term,
+		PrevLogIndex: rf.nextIndex[server] - 1, PrevLogTerm: rf.logs[relativeNextIndex-1].Term,
 		Entries: nil, LeaderCommit: rf.commitIndex}
-	if rf.nextIndex[server] < len(rf.logs) {
-		args.Entries = append(args.Entries, rf.logs[rf.nextIndex[server]:]...) // "..."类似于python中的序列拆包
-		DPrintf("[%s %d/%d]: args.Entries=%v for peer %d", stateStr[rf.state], rf.me, rf.currentTerm, args.Entries, server)
+	// lab3B，重要，如果relativeNextIndex-1==0，就会导致args.PrevLogTerm==0，错了，这是哨兵的term，raft server的term至少从1开始。
+	// 此时应该设置args.PrevLogTerm=rf.lastIncludeTerm。
+	if relativeNextIndex-1 == 0 {
+		args.PrevLogTerm = rf.lastIncludedTerm
+	}
+	if relativeNextIndex < len(rf.logs) {
+		args.Entries = append(args.Entries, rf.logs[relativeNextIndex:]...) // "..."类似于python中的序列拆包
+		DPrintf("[%s %d/%d]: args.Entries=%v to peer %d", stateStr[rf.state], rf.me, rf.currentTerm, args.Entries, server)
 	}
 	rf.mu.Unlock()
 	reply := AppendEntriesReply{}
@@ -733,7 +998,8 @@ func (rf *Raft) sendAndWaitAppendEntriesRPC(server int) {
 				var i int
 				for i = len(rf.logs) - 1; i >= 0; i-- { // 要找最后一个，可以直接从后往前搜索第一个。
 					if rf.logs[i].Term == reply.ConflictTerm {
-						rf.nextIndex[server] = i + 1
+						// rf.nextIndex[server] = i + 1
+						rf.nextIndex[server] = rf.absIndex(i + 1)
 						break
 					}
 				}
@@ -741,10 +1007,10 @@ func (rf *Raft) sendAndWaitAppendEntriesRPC(server int) {
 					rf.nextIndex[server] = reply.ConflictIndex
 				}
 			}
-			// 对于这个快速反馈算法，对于follower应该怎么设置reply.ConflictIndex和reply.ConflictTerm，
+			// 对于这个快速回溯nextIndex算法，对于follower应该怎么设置reply.ConflictIndex和reply.ConflictTerm，
 			// 其实可以从leader端对各种情况的处理来入手。这些情况包括，
-			// a) follower没有RPC携带的LogEntry，即follower的log更短，leader直接将nextIndex[i]设置为follower的log的长度，这样下一次follower的log就包含args.PrevLogIndex了；
-			// b) follower的log在args.PrevLogIndex冲突，若leader的log中包含termF的LogEntry，则leader将nextIndex[i]设置为其log中最后一个为termF的LogEntry的下标+1，这样下次args.PrevLogTerm就等于termF了；
+			// a) follower没有args.Entries，即follower的log更短，leader直接将nextIndex[i]设置为len(f.logs)，这样下一次follower的log就包含args.PrevLogIndex了；
+			// b) follower的log在args.PrevLogIndex冲突，若leader的log中包含termF=f.logs[args.PrevLogIndex].Term的LogEntry，则leader将nextIndex[i]设置为其log中最后一个为termF的LogEntry的下标+1，这样下次args.PrevLogTerm就等于termF了；
 			// c) 若leader的log不包含termF的LogEntry，则leader将nextIndex[i]设置为follower的log中第一个termF的LogEntry的下标，这样下一个args.PrevLogIndex直接跳过这些leader的log中没有的LogEntry了。
 		}
 	} else {
@@ -755,7 +1021,8 @@ func (rf *Raft) sendAndWaitAppendEntriesRPC(server int) {
 
 func (rf *Raft) computeCommitIndex(follower int) int {
 	for i := rf.matchIndex[follower]; i >= rf.commitIndex; i-- {
-		if rf.logs[i].Term != rf.currentTerm {
+		relativeI := rf.relativeIndex(i)
+		if rf.logs[relativeI].Term != rf.currentTerm {
 			// Figure 8 illustrates a situation where an old log entry is stored on a majority of servers,
 			// yet can still be overwritten by a future leader.
 			// 在Figure 8(c)中，此时S1的term是4，即使它把2复制到了majority上，它也不能直接commit它，
@@ -784,6 +1051,44 @@ func (rf *Raft) computeCommitIndex(follower int) int {
 	return rf.commitIndex // 返回原commitIndex。
 }
 
+func (rf *Raft) sendAndWaitInstallSnapshotRPC(server int) {
+	rf.mu.Lock()
+	// 注意deep copy snapshot，而不是shallow copy。
+	args := InstallSnapshotArgs{Term: rf.currentTerm, LeaderID: rf.me, KVTable: make(map[string]string), DuplicateTable: make(map[int32]int64),
+		LastIncludedIndex: rf.lastIncludedIndex, LastIncludedTerm: rf.lastIncludedTerm}
+	for k, v := range rf.kvTable {
+		args.KVTable[k] = v
+	}
+	for k, v := range rf.duplicateTable {
+		args.DuplicateTable[k] = v
+	}
+	rf.mu.Unlock()
+	reply := InstallSnapshotReply{}
+	if rf.sendInstallSnapshot(server, &args, &reply) {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		// 对RPC响应的处理规则：不同term不处理，非处理角色不处理。
+		if rf.currentTerm != reply.Term || rf.state != leader {
+			return
+		}
+		if reply.Term > rf.currentTerm {
+			// term是raft算法中的时间量度，所有raft server都要随时紧跟最新的term。
+			rf.currentTerm = reply.Term
+			rf.becomeFollower()
+			rf.persist()
+			return
+		}
+		// 记得更新rf.nextIndex！
+		rf.nextIndex[server] = rf.lastIncludedIndex + 1
+		rf.matchIndex[server] = rf.lastIncludedIndex
+	} else {
+		// RPC失败了，只需简单地退出，留待leaderEventLoop()统一在下一轮heartbeat时再次间接调用该函数发送InstallSnapshot RPC。
+		// 而不是这个线程自己在这里重试，如果这样，那比如重试时leader的成员值更新了，甚至不再是leader了，这些情况是不是
+		// 在重试期间要考虑，这会使代码变得复杂，只需简单退出，由leaderEventLoop()自然地解决这些情况即可。
+		// **复用现有代码**
+	}
+}
+
 func (rf *Raft) responToClient() {
 	// 注意，Client的指代是相对的、灵活的，在同一个服务端程序中，层A请求层B，层A就是层B的Client。
 	var start, nToApply int
@@ -798,10 +1103,14 @@ func (rf *Raft) responToClient() {
 		// 为了计算出从哪个LogEntry开始apply，我们需要先使用完旧的rf.lastApplied再更新rf.lastApplied，
 		// 而写rf.applyReq的代码则要先更新rf.commitIndex。
 		start = rf.lastApplied + 1
+		relativeStart := rf.relativeIndex(start)
 		nToApply = rf.commitIndex - rf.lastApplied
 
+		// DPrintf("[%s %d/%d] start=%d, lastIncludeIndex=%d, nToApply=%d, lastApplied=%d",
+		// 	stateStr[rf.state], rf.me, rf.currentTerm, start, rf.lastIncludedIndex, nToApply, rf.lastApplied)
+
 		toApply = make([]LogEntry, nToApply)
-		copy(toApply, rf.logs[start:start+nToApply]) // 拷贝到局部变量，减小临界区大小。
+		copy(toApply, rf.logs[relativeStart:relativeStart+nToApply]) // 拷贝到局部变量，减小临界区大小。
 		rf.lastApplied = rf.commitIndex
 		rf.mu.Unlock()
 
@@ -861,9 +1170,28 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.leaderEventLoopDone = make(chan struct{})
 	rf.timeout = time.NewTimer(getRandomTimeout())
 	rf.applyReq = make(chan struct{})
+	// lab3B
+	rf.lastIncludedIndex = 0
+	rf.lastIncludedTerm = 0
+	// rf.kvTable和rf.duplicateTabel由该Raft关联的KVServer调用LoadSnapshot()初始化。
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	// If, when the server comes back up, it reads the updated snapshot, but the outdated log,
+	// it may end up applying some log entries that are already contained within the snapshot.
+	// This happens since the commitIndex and lastApplied are not persisted,
+	// and so Raft doesn’t know that those log entries have already been applied.
+	// The fix for this is to introduce a piece of persistent state to Raft that records
+	// what “real” index the first entry in Raft’s persisted log corresponds to.
+	// This can then be compared to the loaded snapshot’s lastIncludedIndex to determine
+	// what elements at the head of the log to discard.
+	if rf.commitIndex < rf.lastIncludedIndex {
+		rf.commitIndex = rf.lastIncludedIndex
+		rf.lastApplied = rf.lastIncludedIndex
+	} else if rf.lastApplied < rf.lastIncludedIndex {
+		rf.lastApplied = rf.lastIncludedIndex
+	}
 
 	// 专门串行写applyCh，保证写入的LogEntry不会乱序，而且避免其它线程阻塞。
 	go rf.responToClient()

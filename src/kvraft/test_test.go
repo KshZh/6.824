@@ -1,15 +1,16 @@
 package raftkv
 
-import "linearizability"
-
-import "testing"
-import "strconv"
-import "time"
-import "math/rand"
-import "log"
-import "strings"
-import "sync"
-import "sync/atomic"
+import (
+	"linearizability"
+	"log"
+	"math/rand"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -619,13 +620,11 @@ func TestSnapshotRPC3B(t *testing.T) {
 		time.Sleep(electionTimeout)
 		Put(cfg, ck1, "b", "B")
 	}
-
 	// check that the majority partition has thrown away
 	// most of its log entries.
 	if cfg.LogSize() > 2*maxraftstate {
 		t.Fatalf("logs were not trimmed (%v > 2*%v)", cfg.LogSize(), maxraftstate)
 	}
-
 	// now make group that requires participation of
 	// lagging server, so that it has to catch up.
 	cfg.partition([]int{0, 2}, []int{1})
@@ -638,7 +637,6 @@ func TestSnapshotRPC3B(t *testing.T) {
 		check(cfg, t, ck1, "1", "1")
 		check(cfg, t, ck1, "49", "49")
 	}
-
 	// now everybody
 	cfg.partition([]int{0, 1, 2}, []int{})
 
