@@ -35,10 +35,11 @@ func check(t *testing.T, groups []int, ck *Clerk) {
 	// more or less balanced sharding?
 	counts := map[int]int{}
 	for _, g := range c.Shards {
-		counts[g] += 1
+		counts[g] += 1 // counts[g]表示group g所负责的shard数。
 	}
 	min := 257
 	max := 0
+	// 找出counts中的最大值和最小值。
 	for g, _ := range c.Groups {
 		if counts[g] > max {
 			max = counts[g]
@@ -47,6 +48,7 @@ func check(t *testing.T, groups []int, ck *Clerk) {
 			min = counts[g]
 		}
 	}
+	// 要求该最大值和最小值之差不超过1，这才算balanced。
 	if max > min+1 {
 		t.Fatalf("max %v too much larger than min %v", max, min)
 	}
@@ -86,9 +88,8 @@ func TestBasic(t *testing.T) {
 
 	fmt.Printf("Test: Basic leave/join ...\n")
 
-	cfa := make([]Config, 6)
+	cfa := make([]Config, 6) // configuration
 	cfa[0] = ck.Query(-1)
-
 	check(t, []int{}, ck)
 
 	var gid1 int = 1
@@ -125,6 +126,7 @@ func TestBasic(t *testing.T) {
 	for s := 0; s < nservers; s++ {
 		cfg.ShutdownServer(s)
 		for i := 0; i < len(cfa); i++ {
+			fmt.Printf("-------------------------- %d", i)
 			c := ck.Query(cfa[i].Num)
 			check_same_config(t, c, cfa[i])
 		}

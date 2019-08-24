@@ -111,8 +111,12 @@ func (kv *KVServer) execute(clerkID int32, reqID int64) bool {
 	if ok && reqID <= latestReqID {
 		return false // duplicate request，该操作已经执行过了，不再执行。
 	}
+	// fatal error: concurrent map iteration and map write
+	// fix bug，因为Raft发送InstallSnapshot时，会访问kvTable和duplicateTable，所以要加锁，避免竞争条件。
+	kv.rf.MU.Lock()
 	kv.duplicateTable[clerkID] = reqID // 新的request。
-	return true                        // 非重复请求，执行操作。
+	kv.rf.MU.Unlock()
+	return true // 非重复请求，执行操作。
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -144,7 +148,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		kv.mu.Unlock()
 	} else {
 		reply.WrongLeader = true
-		reply.Err = ErrStaleLeader // 或ErrWrongLeader。
+		reply.Err = ErrStaleLeader // 或ErrNotLeader。
 	}
 }
 
@@ -165,7 +169,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	succ := kv.proposeOp(op)
 	if !succ {
 		reply.WrongLeader = true
-		reply.Err = ErrStaleLeader // 或ErrWrongLeader。
+		reply.Err = ErrStaleLeader // 或ErrNotLeader。
 	}
 }
 
@@ -204,6 +208,9 @@ func (kv *KVServer) apply() {
 
 		kv.mu.Lock()
 		if kv.execute(op.ClerkID, op.ReqID) {
+			// fatal error: concurrent map iteration and map write
+			// fix bug，因为Raft发送InstallSnapshot时，会访问kvTable和duplicateTable，所以要加锁，避免竞争条件。
+			kv.rf.MU.Lock()
 			if op.Operation == "Put" {
 				kv.kvTable[op.Key] = op.Value
 				DPrintf("[KVServer %d apply] apply for clerk %d PUT [%s, %s], CommandIndex %d",
@@ -217,6 +224,7 @@ func (kv *KVServer) apply() {
 				DPrintf("[KVServer %d apply] apply for clerk %d Get [%s, %s], CommandIndex %d",
 					kv.me, op.ClerkID, op.Key, kv.kvTable[op.Key], applyMsg.CommandIndex)
 			}
+			kv.rf.MU.Unlock()
 		}
 
 		kv.commandIndex = applyMsg.CommandIndex

@@ -90,29 +90,76 @@ func Test5(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			fmt.Println(i)
-		}() // 传同一个对象引用
+			time.Sleep(5 * time.Millisecond)
+			fmt.Print(i) // 这里的i和外部的循环变量i是同一个变量，标识同一个int对象。
+		}()
 	}
 	wg.Wait()
+	fmt.Println()
+	// 输出：4444
 	for i := 0; i < 4; i++ {
 		wg.Add(1)
-		go func(k int) {
+		go func(i int) {
 			defer wg.Done()
-			fmt.Println(k)
-		}(i) // 传值
+			time.Sleep(5 * time.Millisecond)
+			fmt.Print(i) // 这里的是当前函数的局部变量/形参i，与外部的循环变量i不是同一个变量，它们标识不同的int对象。
+		}(i) // 通过实参初始化形参，将i标识的对象拷贝给/覆盖形参i变量标识的对象。
 	}
 	wg.Wait()
+	fmt.Println()
+	// 输出：0123
 	for i := 0; i < 3; i++ {
+		// 每次循环，就创建一个新的变量args，标识一个新的对象。而旧的args变量及其对象的释放由go的垃圾回收负责。
 		args := AppendEntriesArgs{Entries: nil}
-		args.Entries = make([]int, i)
+		args.Entries = make([]int, i) // 创建一个slice对象和一个长度为i的底层数组对象，底层数组对象由slice对象内部的成员变量标识。
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			time.Sleep(100)
-			fmt.Println(len(args.Entries))
-		}() // 传引用，且引用的是不同的对象，而不是同一个对象
+			time.Sleep(5 * time.Millisecond)
+			fmt.Print(len(args.Entries)) // 这里的args和外部**当前循环的**变量args是同一个变量，标识同一个对象。
+		}()
 	}
 	wg.Wait()
+	fmt.Println()
+	// 输出：120
+
+	var ch1 chan bool
+	println(&ch1)
+	for i := 0; i < 3; i++ {
+		ch1 = make(chan bool) // 还是同一个变量ch1，但标识了一个新的对象（在ch1原标识的对象上创建一个新的对象覆盖之）
+		println(&ch1)
+		go func() {
+			time.Sleep(5 * time.Millisecond)
+			println(&ch1) // 这里的变量ch1和外部的ch1变量是同一个变量，标识同一个channel对象。
+			// 因此在外部/别处对变量ch1标识的对象所作的任何操作（修改/覆盖等），也都会被持有同一个变量的代码观察到(observe)。
+		}()
+		// 于是结果就是三个线程使用同一个变量标识的一个channel对象。
+	}
+	time.Sleep(1 * time.Second)
+	// 输出：打印的是同一个地址。
+
+	for i := 0; i < 3; i++ {
+		ch2 := make(chan bool) // 新的实体，还有新的变量。
+		go func() {
+			time.Sleep(5 * time.Millisecond)
+			println(&ch2)
+		}()
+		// 结果是三个线程使用三个不同变量标识的三个不同对象。
+	}
+	time.Sleep(1 * time.Second)
+	// 输出：打印不同的地址。
+
+	var ch3 chan bool
+	for i := 0; i < 3; i++ {
+		ch3 = make(chan bool) // 只是新的对象，变量不变，覆盖掉该变量标识的旧对象。
+		go func(ch3 chan bool) {
+			time.Sleep(1 * time.Second)
+			println(&ch3)
+		}(ch3) // 将ch3标识的对象拷贝到形参变量ch3标识的对象（初始值为nil）上。
+		// 结果也是三个线程使用三个不同变量标识的三个不同对象。
+	}
+	time.Sleep(1 * time.Second)
+	// 输出：打印不同的地址。
 }
 
 func Test13(t *testing.T) {
@@ -221,48 +268,6 @@ func TestSelectChannel(t *testing.T) {
 	// 1
 	// exit    (after about 5 second, I expect that it is printed after about 1 second too.)
 	// 2
-}
-
-func TestVariableDelivery(t *testing.T) {
-	var ch1 chan bool
-	for i := 0; i < 3; i++ {
-		ch1 = make(chan bool) // 新的实体。
-		go func() {
-			time.Sleep(1 * time.Second)
-			fmt.Println(&ch1)
-		}() // 传引用变量ch1本身的引用，ch1的值的改变可以被所有引用ch1的线程看/观察到。
-		// 于是结果就是三个线程引用同一个引用变量/标签，所以就使用的是同一个标签上的同一个channel实体。
-	}
-	time.Sleep(2 * time.Second)
-	// 0xc00000c028
-	// 0xc00000c028
-	// 0xc00000c028
-
-	for i := 0; i < 3; i++ {
-		ch2 := make(chan bool) // 新的实体，还有新的引用变量。
-		go func() {
-			time.Sleep(1 * time.Second)
-			fmt.Println(&ch2)
-		}() // 传引用变量ch2本身的引用，但每次循环创建一个新的引用变量ch2，所以三个线程各自引用三个不同的引用变量，以及三个不同的channel实体。
-	}
-	time.Sleep(2 * time.Second)
-	// 0xc00000c038
-	// 0xc00000c048
-	// 0xc00000c040
-
-	// 当然也可以传递引用变量ch3本身的拷贝，而不是其引用，这样可以不用每次创建一次引用变量，当然还是上一种方便一点。
-	var ch3 chan bool
-	for i := 0; i < 3; i++ {
-		ch3 = make(chan bool) // 新的实体，还有新的引用变量
-		go func(ch3 chan bool) {
-			time.Sleep(1 * time.Second)
-			fmt.Println(&ch3)
-		}(ch3) // 传引用变量ch2本身的引用，但每次循环创建一个新的引用变量ch2，所以三个线程各自引用三个不同的引用变量，以及三个不同的channel实体。
-	}
-	time.Sleep(2 * time.Second)
-	// 0xc0000f6000
-	// 0xc0000de020
-	// 0xc0000de028
 }
 
 type TestGobMapT struct {
@@ -503,37 +508,34 @@ func TestSelect(t *testing.T) {
 	// }
 }
 
-type testReference struct {
+type testCopy struct {
 	s string
 }
 
-func TestReference(t *testing.T) {
-	// 引用变量就像标签，贴在实体对象上。
+func TestCopy(t *testing.T) {
+	// 当对象没有引用其它对象时，浅拷贝与深拷贝一样。
+	o1 := testCopy{}
+	o2 := o1
+	o1.s = "123"
+	fmt.Printf("%p, %v\n%p, %v\n", &o1, o1, &o2, o2)
 
+	// slice对象是一个结构体实例，它有一个指针指向底层数组对象。
+	// map对象也是一个结构体实例，它有一个指针指向底层哈希表对象。
 	data := map[rune]int{'a': 1, 'v': 3, 'd': 19}
-	ref := data // 浅复制
-	data['x'] = 8
-	println(data)
-	println(ref)
-	// 地址相同，引用变量就像贴在实体对象上的标签。
-	// 0xc0000b9f68
-	// 0xc0000b9f68
+	data1 := data // 浅拷贝。
+	data1['x'] = 8
+	fmt.Printf("%p, %v\n%p, %v\n", &data, data, &data1, data1)
+	// 0xc000006520, map[97:1 100:19 118:3 120:8]
+	// 0xc000006528, map[97:1 100:19 118:3 120:8]
+	// 不同的变量标识不同的map对象，但这些map对象的指针成员都指向同一个底层哈希表对象
+}
 
-	fmt.Printf("%v\n", data)
-	fmt.Printf("%v\n", ref)
-
-	// 多个对同一实体的引用，实体的修改可被这些引用观察(observe)到。
-	// map[97:1 100:19 118:3 120:8]
-	// map[97:1 100:19 118:3 120:8]
-
-	obj := testReference{"dsa"}
-	nonRef := obj // 与前面不同，这些不是引用变量，赋值是深拷贝。
-	p1 := &obj    // 如果想浅拷贝，可以使用指针。
-	println(&obj)
-	println(&nonRef)
-	println(p1)
-	nonRef.s = "xxx"
-	fmt.Printf("%v\n", obj)
-	fmt.Printf("%v\n", nonRef)
-	fmt.Printf("%v\n", *p1)
+func TestForRange(t *testing.T) {
+	x := map[int][]rune{1: []rune{'a', 'b', 'c'}, 2: []rune{'d', 'e'}}
+	for k, _ := range x {
+		// v = v[1:] // 这只是改变了局部变量slice v，而没有改变x[k]。
+		// 如果要改变x[k]，则应该：
+		x[k] = x[k][1:]
+	}
+	fmt.Printf("%v\n", x)
 }

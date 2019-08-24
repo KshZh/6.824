@@ -59,7 +59,7 @@ var stateStr = [3]string{"follower", "candidate", "leader"}
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	MU        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -120,8 +120,8 @@ type LogEntry struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.MU.Lock()
+	defer rf.MU.Unlock()
 
 	term := rf.currentTerm
 	isLeader := rf.state == leader
@@ -130,8 +130,8 @@ func (rf *Raft) GetState() (int, bool) {
 }
 
 func (rf *Raft) RaftStateSize() int {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.MU.Lock()
+	defer rf.MU.Unlock()
 
 	return rf.persister.RaftStateSize()
 
@@ -157,8 +157,8 @@ func (rf *Raft) MakeSnapshotAndPersist(commandIndex int) {
 	// 造成持久化的各状态不一致。而且要删除rf.logs的一些LogEntry，而且要更新rf.commitIndex等，所以更要加锁，让这个操作变成原子的，
 	// 让这块代码成为串行执行的一片，否则会出现比如我们删完了rf.logs，即将修改rf.nextIndex之前，其它线程
 	// 使用了未修改的rf.nextIndex访问rf.logs，这时可能导致数组访问越界错误。
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.MU.Lock()
+	defer rf.MU.Unlock()
 
 	relativeCommandIndex := rf.relativeIndex(commandIndex)
 
@@ -334,8 +334,8 @@ type RequestVoteReply struct {
 // 然后从这个角度来考虑问题。
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.MU.Lock()
+	defer rf.MU.Unlock()
 
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
@@ -430,12 +430,12 @@ type AppendEntriesReply struct {
 // 明确只有leader才发送AppendEntries RPC，所以在AppendEntries RPC的处理函数中，我们可以认为发送者是一个leader，
 // 然后从这个角度考虑问题。
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.MU.Lock()
+	defer rf.MU.Unlock()
 	reply.Term = rf.currentTerm
 	reply.Success = false
 
-	// DPrintf("[%s %d/%d]: AppendEntries RPC handler, args=%+v, rf.lastIncludeIndex=%d, rf.commitIndex=%d",
+	// DPrintf("XXXX[%s %d/%d]: AppendEntries RPC handler, args=%+v, rf.lastIncludeIndex=%d, rf.commitIndex=%d",
 	// 	stateStr[rf.state], rf.me, rf.currentTerm, *args, rf.lastIncludedIndex, rf.commitIndex)
 
 	// leader收到AppendEntries RPC该怎么办？
@@ -550,7 +550,7 @@ passConsistencyCheck:
 	// 就导致该follower擅自commit了leader还未commit的LogEntry，并且这些LogEntry还可能与leader不一样。
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, rf.absIndex(len(rf.logs)-1)) // 这里不能再用局部变量nlogs了，因为它可能存放的是旧值，除非给它赋新值。
-		DPrintf("FFFF[%s %d/%d]: commitIndex have updated to %d, have commit %v\n",
+		DPrintf("FFFF[%s %d/%d]: commitIndex have updated to %d, have commit %v",
 			stateStr[rf.state], rf.me, rf.currentTerm, rf.commitIndex, rf.logs[:rf.relativeIndex(rf.commitIndex+1)])
 	}
 
@@ -579,8 +579,8 @@ type InstallSnapshotReply struct {
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.MU.Lock()
+	defer rf.MU.Unlock()
 
 	reply.Term = rf.currentTerm
 
@@ -673,8 +673,8 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.MU.Lock()
+	defer rf.MU.Unlock()
 
 	// Your code here (2B).
 	// 只有leader才能处理客户端的请求。
@@ -760,7 +760,7 @@ func (rf *Raft) becomeFollower() {
 func (rf *Raft) becomeLeader() {
 	// 约定caller要在持锁时才能调用becomeLeader()，因为它会读写共享变量。
 	if rf.state == leader {
-		rf.mu.Unlock()
+		rf.MU.Unlock()
 		panic("a leader call becomeLeader()")
 	}
 
@@ -791,7 +791,7 @@ func (rf *Raft) electionEventLoop() {
 		select {
 		case <-rf.timeout.C:
 			nVote = 1
-			rf.mu.Lock()
+			rf.MU.Lock()
 			rf.state = candidate // modify state
 			rf.currentTerm++     // Increment currentTerm
 			rf.votedFor = rf.me  // Vote for self
@@ -801,7 +801,7 @@ func (rf *Raft) electionEventLoop() {
 			// 	LastLogIndex: len(rf.logs) - 1, LastLogTerm: rf.logs[len(rf.logs)-1].Term}
 			args := RequestVoteArgs{Term: rf.currentTerm, CandidateID: rf.me,
 				LastLogIndex: rf.absIndex(len(rf.logs) - 1), LastLogTerm: rf.logs[len(rf.logs)-1].Term}
-			rf.mu.Unlock()
+			rf.MU.Unlock()
 			DPrintf("[%s %d/%d]: timeout, start the election", stateStr[rf.state], rf.me, rf.currentTerm)
 			// Send RequestVote RPCs to all other servers
 			for i := 0; i < rf.nPeers; i++ {
@@ -834,8 +834,8 @@ func (rf *Raft) sendAndWaitRequestVoteRPC(server int, args *RequestVoteArgs, pee
 	// if rf.sendRequestVote(server, &args, &reply) && rf.currentTerm == args.Term && rf.state == candidate {
 	if rf.sendRequestVote(server, args, reply) {
 		// 注意语句顺序，并且注意不要在阻塞操作rf.sendRequestVote()前加锁，要在之后加锁。
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
+		rf.MU.Lock()
+		defer rf.MU.Unlock()
 		if !(rf.currentTerm == args.Term && rf.state == candidate) {
 			return
 		}
@@ -857,13 +857,13 @@ func (rf *Raft) sendAndWaitRequestVoteRPC(server int, args *RequestVoteArgs, pee
 			// 2019/05/07 13:47:31 [follower  1/0]: RequestVote RPC handler, come across newer term 1, back to follower
 			// 2019/05/07 13:47:31 [follower  1/1]: vote for candidate 2
 			// 2019/05/07 13:47:32 [candidate 0/2]: timeout, start the election
-			rf.mu.Unlock()
+			rf.MU.Unlock()
 			select {
 			case peersVoteForMe <- struct{}{}:
 			case <-rf.electionEventLoopDone: // 确保该线程最终会退出。
 			case <-rf.shutdown:
 			}
-			rf.mu.Lock() // 因为前面写了`defer rf.mu.Unlock()`。
+			rf.MU.Lock() // 因为前面写了`defer rf.MU.Unlock()`。
 		}
 	}
 }
@@ -894,10 +894,10 @@ func (rf *Raft) leaderEventLoop() {
 
 func (rf *Raft) sendAndWaitAppendEntriesRPC(server int) {
 	// 注意，由于可能同时有多个sendAndWaitAppendEntriesRPC()同时执行，所以读写共享变量时，必须上锁。
-	rf.mu.Lock()
+	rf.MU.Lock()
 	if rf.state != leader {
 		// panic("Not a leader but sendAndWaitAppendEntriesRPC()")
-		rf.mu.Unlock() // 记得解锁，不然会死锁。
+		rf.MU.Unlock() // 记得解锁，不然会死锁。
 		return
 	}
 	// 因为所有Raft server的log在0处都有同样的哨兵，所以有这样一个不变量：rf.nextIndex[i] >= 1。
@@ -921,7 +921,7 @@ func (rf *Raft) sendAndWaitAppendEntriesRPC(server int) {
 
 		// go rf.sendAndWaitInstallSnapshotRPC(server)
 		// XXX 这里没必要再开另一个线程，直接在这个线程执行就行了。
-		rf.mu.Unlock()
+		rf.MU.Unlock()
 		// 把剩下的工作交给sendAndWaitInstallSnapshotRPC()。
 		rf.sendAndWaitInstallSnapshotRPC(server)
 		return
@@ -931,6 +931,8 @@ func (rf *Raft) sendAndWaitAppendEntriesRPC(server int) {
 	args := AppendEntriesArgs{Term: rf.currentTerm, LeaderID: rf.me,
 		PrevLogIndex: rf.nextIndex[server] - 1, PrevLogTerm: rf.logs[relativeNextIndex-1].Term,
 		Entries: nil, LeaderCommit: rf.commitIndex}
+	// DPrintf("YYYY[%s %d/%d]: rf.nextIndex[%d]=%d, relativeNextIndex=%d, rf.commitIndex=%d, args.LeaderCommit=%d",
+	// 	stateStr[rf.state], rf.me, rf.currentTerm, server, rf.nextIndex[server], relativeNextIndex, rf.commitIndex, args.LeaderCommit)
 	// lab3B，重要，如果relativeNextIndex-1==0，就会导致args.PrevLogTerm==0，错了，这是哨兵的term，raft server的term至少从1开始。
 	// 此时应该设置args.PrevLogTerm=rf.lastIncludeTerm。
 	if relativeNextIndex-1 == 0 {
@@ -938,15 +940,15 @@ func (rf *Raft) sendAndWaitAppendEntriesRPC(server int) {
 	}
 	if relativeNextIndex < len(rf.logs) {
 		args.Entries = append(args.Entries, rf.logs[relativeNextIndex:]...) // "..."类似于python中的序列拆包
-		DPrintf("[%s %d/%d]: args.Entries=%v to peer %d", stateStr[rf.state], rf.me, rf.currentTerm, args.Entries, server)
+		// DPrintf("[%s %d/%d]: args.Entries=%v to peer %d", stateStr[rf.state], rf.me, rf.currentTerm, args.Entries, server)
 	}
-	rf.mu.Unlock()
+	rf.MU.Unlock()
 	reply := AppendEntriesReply{}
 	// 有竞争条件的代码：
 	// if rf.sendAppendEntries(server, &args, &reply) && args.Term == rf.currentTerm && rf.state == leader
 	if rf.sendAppendEntries(server, &args, &reply) {
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
+		rf.MU.Lock()
+		defer rf.MU.Unlock()
 		// 是否处理RPC响应的规则：不同term不处理，非处理角色不处理
 		if !(args.Term == rf.currentTerm && rf.state == leader) {
 			return
@@ -972,6 +974,7 @@ func (rf *Raft) sendAndWaitAppendEntriesRPC(server int) {
 			// 考虑多个携带LogEntry的RPC请求相继发送，但乱序返回响应的情况。
 			rf.nextIndex[server] = args.PrevLogIndex + 1 + len(args.Entries)
 			rf.matchIndex[server] = rf.nextIndex[server] - 1
+			// DPrintf("[LLLL] %d %d", args.PrevLogIndex, rf.nextIndex[server])
 			newCommitIndex := rf.computeCommitIndex(server)
 			if newCommitIndex != rf.commitIndex {
 				rf.commitIndex = newCommitIndex
@@ -983,8 +986,8 @@ func (rf *Raft) sendAndWaitAppendEntriesRPC(server int) {
 				DPrintf("LLLL[%s %d/%d] update commitIndex to %d",
 					stateStr[rf.state], rf.me, rf.currentTerm, newCommitIndex)
 			}
-		} else {
-			// 此次RPC是不带LogEntry的log agreement或heartbeat，
+		} else if !reply.Success {
+			// 此次RPC是带或不带LogEntry的log agreement或heartbeat，
 			// 无论哪一种，consistency check失败了，也就是follower与leader的log不一致，都需要回退nextIndex。
 			// logs不一致，回退nextIndex，然后简单地退出，留待leader下一轮AppendEntries RPC。
 
@@ -1052,21 +1055,23 @@ func (rf *Raft) computeCommitIndex(follower int) int {
 }
 
 func (rf *Raft) sendAndWaitInstallSnapshotRPC(server int) {
-	rf.mu.Lock()
+	rf.MU.Lock()
 	// 注意deep copy snapshot，而不是shallow copy。
 	args := InstallSnapshotArgs{Term: rf.currentTerm, LeaderID: rf.me, KVTable: make(map[string]string), DuplicateTable: make(map[int32]int64),
 		LastIncludedIndex: rf.lastIncludedIndex, LastIncludedTerm: rf.lastIncludedTerm}
+	// fatal error: concurrent map iteration and map write
+	// 修复的方法是在KVServer中当需要写map时，加rf.MU锁。
 	for k, v := range rf.kvTable {
 		args.KVTable[k] = v
 	}
 	for k, v := range rf.duplicateTable {
 		args.DuplicateTable[k] = v
 	}
-	rf.mu.Unlock()
+	rf.MU.Unlock()
 	reply := InstallSnapshotReply{}
 	if rf.sendInstallSnapshot(server, &args, &reply) {
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
+		rf.MU.Lock()
+		defer rf.MU.Unlock()
 		// 对RPC响应的处理规则：不同term不处理，非处理角色不处理。
 		if rf.currentTerm != reply.Term || rf.state != leader {
 			return
@@ -1099,7 +1104,7 @@ func (rf *Raft) responToClient() {
 		case <-rf.shutdown:
 			return
 		}
-		rf.mu.Lock()
+		rf.MU.Lock()
 		// 为了计算出从哪个LogEntry开始apply，我们需要先使用完旧的rf.lastApplied再更新rf.lastApplied，
 		// 而写rf.applyReq的代码则要先更新rf.commitIndex。
 		start = rf.lastApplied + 1
@@ -1112,7 +1117,7 @@ func (rf *Raft) responToClient() {
 		toApply = make([]LogEntry, nToApply)
 		copy(toApply, rf.logs[relativeStart:relativeStart+nToApply]) // 拷贝到局部变量，减小临界区大小。
 		rf.lastApplied = rf.commitIndex
-		rf.mu.Unlock()
+		rf.MU.Unlock()
 
 		for i := 0; i < nToApply; i++ {
 			rf.applyCh <- ApplyMsg{CommandValid: true, Command: toApply[i].Command, CommandIndex: start + i}
