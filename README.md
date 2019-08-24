@@ -26,3 +26,6 @@
 
      - [ ] Challenge: Client requests during configuration changes
 
+git tag
+
+git checkout
